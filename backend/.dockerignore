@@ -1,0 +1,13 @@
+node_modules
+dist
+coverage
+*.log
+.env
+.env.*.local
+.env.local
+.git
+.github
+.claude
+uploads
+certificado
+*.md

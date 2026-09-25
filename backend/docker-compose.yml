@@ -16,5 +16,21 @@ services:
       timeout: 5s
       retries: 10
 
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Dentro de la red de docker compose, Postgres se resuelve por el nombre del
+      # servicio ("postgres"), no por "localhost" — esto pisa lo que traiga .env.
+      DATABASE_URL: postgresql://user:password@postgres:5432/evangelicapp
+      PORT: 3001
+    ports:
+      - '3001:3001'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres_data:
