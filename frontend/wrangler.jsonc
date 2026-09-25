@@ -1,0 +1,31 @@
+{
+	// Config de despliegue a Cloudflare Workers vía @opennextjs/cloudflare.
+	// Cloudflare Workers es el hosting elegido para producción (no Vercel) —
+	// plan completo en frontend/docs/deploy-produccion.md.
+	//
+	// El name tiene que coincidir con el Worker que Workers Builds construye
+	// (hoy "evangelicapp", que construye la rama `staging`). Si no coinciden,
+	// `wrangler deploy` tira "Failed to match Worker name" e intenta abrir un PR
+	// para "corregirlo".
+	//
+	// Custom domain: `app.evangelicapp.cl` ya está activo, configurado desde el
+	// dashboard (Worker → Settings → Domains & Routes), no acá — declarar
+	// `routes`/`custom_domain` en este archivo sería redundante y puede chocar
+	// con lo del dashboard. El subdominio `*.workers.dev`
+	// (evangelicapp.rojascofrem.workers.dev) sigue resolviendo en paralelo a
+	// propósito: se deja hasta separar un entorno de staging real, porque los
+	// preview deployments de Workers Builds dependen de él (ver
+	// docs/deploy-produccion.md).
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "evangelicapp",
+	"main": ".open-next/worker.js",
+	"compatibility_date": "2026-08-25",
+	// nodejs_compat: requerido por @opennextjs/cloudflare (usa APIs de Node
+	// internamente). global_fetch_strictly_public: flag recomendado por el
+	// mismo adapter para el ejemplo oficial (create-next-app) al día de hoy.
+	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+	"assets": {
+		"directory": ".open-next/assets",
+		"binding": "ASSETS"
+	}
+}
