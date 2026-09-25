@@ -1,0 +1,690 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================================================
+// ENUMS
+// ==========================================================================
+
+enum Rol {
+  SUPER_ADMIN
+  MANAGER
+  USUARIO
+}
+
+/// Módulos delegables por el MANAGER a un USUARIO vía AccesoModulo (pantalla de Accesos).
+enum ModuloSistema {
+  AGENDA
+  FINANZAS
+  CEREMONIAS
+  INTEGRANTES
+}
+
+enum EstadoIglesia {
+  ACTIVA
+  /// Oculta por mora (3+ días sin pagar la mensualidad, ver IglesiasService#ocultar):
+  /// ningún usuario de la iglesia puede iniciar sesión ni mantener una sesión activa
+  /// mientras dure este estado (ver AuthService#validateUser y JwtStrategy#validate).
+  SUSPENDIDA
+  INACTIVA
+}
+
+/// Plan comercial contratado por la iglesia. Define topes de uso (ver PLAN_LIMITS en
+/// common/constants/plan.ts) — cantidad máxima de usuarios y de subdepartamentos
+/// financieros. Estrategia comercial: siempre empujar al plan más caro (PRO).
+enum PlanIglesia {
+  BASICO
+  MEDIO
+  PRO
+}
+
+enum TipoEvento {
+  CULTO
+  REUNION
+  LIMPIEZA
+  OTRO
+}
+
+enum EstadoConfirmacionPredicador {
+  PENDIENTE
+  CONFIRMADO
+  RECHAZADO
+}
+
+enum EstadoConfirmacionAsistencia {
+  PENDIENTE
+  CONFIRMADO
+  RECHAZADO
+}
+
+enum TipoMovimiento {
+  INGRESO
+  EGRESO
+}
+
+/// Solo distingue cómo se recibió/pagó la plata — no implica cajas ni cuentas separadas.
+enum MedioPago {
+  EFECTIVO
+  TRANSFERENCIA
+}
+
+enum AccionAuditoria {
+  CREACION
+  EDICION
+  ELIMINACION
+}
+
+enum EstadoTarea {
+  PENDIENTE
+  /// El usuario asignado marcó la tarea como hecha; queda esperando que el pastor la apruebe.
+  EN_REVISION
+  COMPLETADA
+}
+
+enum TipoNota {
+  RECORDATORIO
+  NOTA
+}
+
+// ==========================================================================
+// TENANT RAÍZ
+// ==========================================================================
+
+/// Cada fila es un tenant. Ninguna tabla transaccional existe sin apuntar aquí.
+model Iglesia {
+  id                 String        @id @default(cuid())
+  nombre             String
+  logoUrl            String?
+  comuna             String
+  region             String
+  direccion          String?
+  estado             EstadoIglesia @default(ACTIVA)
+  /// Capturado en el onboarding del pastor; usado en dashboards y reportes.
+  visitantesPromedio Int?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  /// Obligatorio desde el alta — no existe iglesia sin plan asignado (ver
+  /// CreateIglesiaDto). Cambiarlo (ver IglesiasService#cambiarPlan) nunca borra
+  /// ni desactiva datos existentes, solo cambia los topes de uso hacia delante.
+  plan PlanIglesia
+
+  /// Próxima fecha en que corresponde pagar la mensualidad. Fijada por el SuperAdmin
+  /// al crear la iglesia; se recalcula (+1 mes desde esta misma fecha, no desde "hoy",
+  /// para no perder el día del mes acordado) cada vez que se confirma un pago manual
+  /// (ver IglesiasService#marcarPagada). No hay pasarela de pago todavía — el estado
+  /// de pago se confirma a mano por ahora.
+  proximaFacturacion DateTime
+
+  /// Último pago confirmado manualmente por el SuperAdmin. Null si nunca se ha
+  /// marcado un pago (ej. la primera facturación, todavía pendiente).
+  ultimoPagoAt DateTime?
+
+  /// Regenerable por el pastor para invalidar un QR impreso (ej. si se filtró) sin tocar el id real del tenant.
+  integrantesQrToken String? @unique @default(cuid())
+
+  usuarios                 Usuario[]
+  eventos                  Evento[]
+  categoriasFinancieras    CategoriaFinanciera[]
+  movimientos              MovimientoFinanciero[]
+  auditoriasFinancieras    MovimientoAuditLog[]
+  departamentosFinancieros DepartamentoFinanciero[]
+  notas                    Nota[]
+  integrantes              Integrante[]
+  matrimonios              Matrimonio[]
+  bautizos                 Bautizo[]
+  defunciones              Defuncion[]
+  presentaciones           Presentacion[]
+  accesosModulo            AccesoModulo[]
+  pagos                    PagoIglesia[]
+  sesionesActividad        SesionActividad[]
+
+  @@map("iglesias")
+}
+
+/// Historial de pagos/confirmaciones de facturación: un registro por cada vez que se
+/// confirma que la iglesia pagó (ver IglesiasService#marcarPagada) más uno inicial al
+/// crear la iglesia (la fecha en que adquirió el plan, ver IglesiasService#create).
+/// No guarda monto: el modelo de precios/monetización todavía está sin definir (ver
+/// CLAUDE.md) — agregar el campo cuando exista un valor real que registrar.
+model PagoIglesia {
+  id        String   @id @default(cuid())
+  fecha     DateTime
+  createdAt DateTime @default(now())
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  /// Quién confirmó el pago (SuperAdmin). SetNull si esa cuenta se borra — el
+  /// historial de la iglesia no debe desaparecer con ella.
+  registradoPorId String?
+  registradoPor   Usuario? @relation("PagoIglesiaRegistradoPor", fields: [registradoPorId], references: [id], onDelete: SetNull)
+
+  @@index([iglesiaId, fecha])
+  @@map("pagos_iglesia")
+}
+
+// ==========================================================================
+// USUARIOS Y AUTH
+// ==========================================================================
+
+/// SUPER_ADMIN es el único rol con iglesiaId nulo (opera fuera de cualquier tenant).
+/// Todos los demás roles quedan atados a exactamente una iglesia. MANAGER es dueño
+/// del tenant (equivalente al antiguo PASTOR); USUARIO reemplaza a TESORERO/SECRETARIA
+/// y su acceso a cada módulo (Agenda, Finanzas, Ceremonias, Integrantes) lo otorga el
+/// MANAGER caso a caso vía AccesoModulo, en vez de venir fijo por el rol.
+model Usuario {
+  id                   String   @id @default(cuid())
+  /// Credencial de login. El email se mantiene como dato de contacto (notificaciones,
+  /// recuperación de cuenta), pero ya no es lo que se usa para autenticarse.
+  username             String   @unique
+  email                String   @unique
+  password             String
+  nombre               String
+  apellido             String
+  telefono             String?
+  fotoUrl              String?
+  rol                  Rol
+  mustChangePassword   Boolean  @default(true)
+  onboardingCompletado Boolean  @default(false)
+  activo               Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  /// Anti-fuerza-bruta del login (ver AuthService#validateUser). Cuenta intentos
+  /// fallidos consecutivos: a los 3 se bloquea el ingreso por 10 min (`lockedUntil`),
+  /// a los 5 se desactiva la cuenta (`activo = false`, reactivación manual). Un login
+  /// exitoso, `changePassword` o `resetPassword` lo dejan en 0.
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+
+  /// Última vez que se vio actividad real del usuario (login, heartbeat o refresh de
+  /// sesión — ver AuthService). Denormalizado a propósito para que "usuarios activos"
+  /// (SuperAdmin y dashboard de manager/usuario) sea un count() directo sin joinear
+  /// contra SesionActividad. Null hasta el primer login tras este cambio.
+  ultimoAccesoAt DateTime?
+
+  /// Fase 7 de docs/supabase.md (convivencia temporal, sin cortar el login propio):
+  /// espejo de este usuario en `auth.users` del proyecto de PRUEBA de Supabase Auth
+  /// (`Backend-auth-test`, no el proyecto real). Null hasta el primer login exitoso
+  /// tras este cambio — AuthService#validateUser lo crea de forma perezosa y
+  /// best-effort en segundo plano (ver SupabaseAuthService#mirrorUsuario). El sistema
+  /// de sesión real (JWT propio, cookies, CSRF) no depende de este campo todavía.
+  supabaseUserId String? @unique
+
+  iglesiaId String?
+  iglesia   Iglesia? @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  eventosCreados        Evento[]                 @relation("EventoCreadoPor")
+  movimientosCreados    MovimientoFinanciero[]   @relation("MovimientoCreadoPor")
+  auditoriasFinancieras MovimientoAuditLog[]     @relation("AuditoriaRealizadaPor")
+  departamentosCreados  DepartamentoFinanciero[] @relation("DepartamentoCreadoPor")
+  notasCreadas          Nota[]                   @relation("NotaCreadaPor")
+  notasAsignadas        Nota[]                   @relation("NotaAsignadaA")
+  refreshTokens         RefreshToken[]
+  passwordResetTokens   PasswordResetToken[]
+  matrimoniosCreados    Matrimonio[]             @relation("MatrimonioCreadoPor")
+  bautizosCreados       Bautizo[]                @relation("BautizoCreadoPor")
+  defuncionesCreadas    Defuncion[]              @relation("DefuncionCreadoPor")
+  presentacionesCreadas Presentacion[]           @relation("PresentacionCreadoPor")
+  accesosPropios        AccesoModulo[]           @relation("AccesosDelUsuario")
+  accesosOtorgados      AccesoModulo[]           @relation("AccesosOtorgados")
+  pagosRegistrados      PagoIglesia[]            @relation("PagoIglesiaRegistradoPor")
+  sesionesActividad     SesionActividad[]
+
+  @@index([iglesiaId])
+  @@index([iglesiaId, ultimoAccesoAt])
+  @@map("usuarios")
+}
+
+/// Tracking de actividad para KPIs (usuarios activos, picos de actividad, tiempo de uso
+/// — ver dashboards de SuperAdmin y de manager/usuario). Una fila por sesión de login:
+/// se abre en AuthService#login, `ultimoLatidoAt` se refresca con cada heartbeat del
+/// frontend (POST /auth/heartbeat, cada ~60s) y con cada refresh de tokens, y se cierra
+/// (`finAt`) en logout explícito. Una sesión abandonada (el usuario cierra la pestaña sin
+/// logout) simplemente deja de recibir heartbeats — no hace falta expirarla a mano, la
+/// duración real de uso ya queda fija en `ultimoLatidoAt`.
+model SesionActividad {
+  id             String    @id @default(cuid())
+  inicioAt       DateTime  @default(now())
+  ultimoLatidoAt DateTime  @default(now())
+  finAt          DateTime?
+
+  usuarioId String
+  usuario   Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  /// Null solo para sesiones de SUPER_ADMIN (no pertenece a ninguna iglesia, igual que
+  /// Usuario.iglesiaId). Denormalizado desde Usuario al crear la fila para poder agregar
+  /// actividad por iglesia sin joinear a Usuario en cada query de KPIs.
+  iglesiaId String?
+  iglesia   Iglesia? @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  @@index([usuarioId, inicioAt])
+  @@index([iglesiaId, inicioAt])
+  @@map("sesiones_actividad")
+}
+
+/// Habilita rotación/revocación de refresh tokens (logout real, no solo expiración).
+model RefreshToken {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  usuarioId String
+  usuario   Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@index([usuarioId])
+  @@map("refresh_tokens")
+}
+
+/// "Olvidé mi contraseña" desde el login. El token viaja en el link del email; acá solo
+/// se guarda su hash SHA-256, nunca el valor. De un solo uso (`usedAt`) y expiración
+/// corta (ver AuthService#requestPasswordReset). No pasa por Supabase Auth: al consumirse,
+/// AuthService actualiza el hash bcrypt local y sincroniza la contraseña a Supabase, igual
+/// que `changePassword`. Fase 8 (RLS): acceso solo bajo `runAsService` (rutas públicas sin
+/// identidad) — la policy la restringe al bypass privilegiado, como `refresh_tokens` pero
+/// esta sí con RLS activa.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  usuarioId String
+  usuario   Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@index([usuarioId])
+  @@map("password_reset_tokens")
+}
+
+/// Otorga a un usuario con rol USUARIO acceso a un módulo puntual (Agenda, Finanzas,
+/// Ceremonias, Integrantes). Solo el MANAGER de la iglesia los administra (ver módulo
+/// `accesos`). MANAGER/SUPER_ADMIN no necesitan filas acá: su acceso es total por rol.
+model AccesoModulo {
+  id        String        @id @default(cuid())
+  modulo    ModuloSistema
+  createdAt DateTime      @default(now())
+
+  usuarioId String
+  usuario   Usuario @relation("AccesosDelUsuario", fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  /// Sin FK reforzada por rol a propósito: si el usuario que otorgó el acceso deja la
+  /// iglesia o se desactiva, el acceso otorgado sigue vigente (SetNull en vez de Cascade).
+  otorgadoPorId String?
+  otorgadoPor   Usuario? @relation("AccesosOtorgados", fields: [otorgadoPorId], references: [id], onDelete: SetNull)
+
+  @@unique([usuarioId, modulo])
+  @@index([iglesiaId])
+  @@map("accesos_modulo")
+}
+
+// ==========================================================================
+// MÓDULO 1 — AGENDA
+// ==========================================================================
+
+model Evento {
+  id                   String     @id @default(cuid())
+  titulo               String
+  descripcion          String?
+  tipo                 TipoEvento
+  fechaInicio          DateTime
+  fechaFin             DateTime
+  ubicacion            String?
+  colorEtiqueta        String?
+  /// Checkbox explícito del pastor/secretaria al crear el evento — nunca se dispara
+  /// automáticamente por `tipo` (ver EventosService#create), para que el envío masivo
+  /// a la congregación sea siempre una decisión caso a caso, no un efecto colateral.
+  notificarIntegrantes Boolean    @default(false)
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  creadoPorId String?
+  creadoPor   Usuario? @relation("EventoCreadoPor", fields: [creadoPorId], references: [id], onDelete: SetNull)
+
+  predicadores Predicador[]
+  asistencias  AsistenciaEvento[]
+
+  @@index([iglesiaId, fechaInicio])
+  @@map("eventos")
+}
+
+/// Solo aplica cuando Evento.tipo = CULTO. El token público permite
+/// confirmar/rechazar desde el email sin necesitar cuenta en la plataforma.
+model Predicador {
+  id                String                       @id @default(cuid())
+  nombre            String?
+  email             String
+  /// Generado en código con un CSPRNG (ver generateSecureToken en eventos.service.ts) —
+  /// cuid() no es apto para esto: prioriza unicidad/orden, no impredecibilidad, y este
+  /// valor es el único factor de autenticación de la ruta pública de confirmación.
+  tokenConfirmacion String                       @unique
+  estado            EstadoConfirmacionPredicador @default(PENDIENTE)
+  respondidoAt      DateTime?
+  createdAt         DateTime                     @default(now())
+
+  eventoId String
+  evento   Evento @relation(fields: [eventoId], references: [id], onDelete: Cascade)
+
+  @@index([eventoId])
+  @@map("predicadores")
+}
+
+/// RSVP masivo a un evento con `notificarIntegrantes = true`. Una fila por
+/// (evento, integrante) — mismo patrón de token público de un solo uso que
+/// Predicador, pero es un flujo separado (congregante vs. predicador invitado)
+/// y por eso tiene su propio enum de estado en vez de reusar el de Predicador.
+model AsistenciaEvento {
+  id                String                       @id @default(cuid())
+  /// Generado en código con un CSPRNG (ver generateSecureToken), no cuid(): es el
+  /// único factor de autenticación de la ruta pública de confirmación.
+  tokenConfirmacion String                       @unique
+  estado            EstadoConfirmacionAsistencia @default(PENDIENTE)
+  respondidoAt      DateTime?
+  createdAt         DateTime                     @default(now())
+
+  eventoId String
+  evento   Evento @relation(fields: [eventoId], references: [id], onDelete: Cascade)
+
+  integranteId String
+  integrante   Integrante @relation(fields: [integranteId], references: [id], onDelete: Cascade)
+
+  // Evita duplicar la invitación al mismo integrante si el envío se reintenta
+  // (createMany usa skipDuplicates apoyado en este mismo constraint).
+  @@unique([eventoId, integranteId])
+  @@index([eventoId])
+  @@map("asistencias_evento")
+}
+
+// ==========================================================================
+// MÓDULO 2 — FINANZAS
+// ==========================================================================
+
+/// Sub-libro financiero opcional dentro de una iglesia (ej. Música, Operaciones).
+/// Un movimiento/categoría con departamentoId = null es "finanzas general" de la iglesia.
+model DepartamentoFinanciero {
+  id     String  @id @default(cuid())
+  nombre String
+  /// Archivado (no hard-delete): oculta el depto del navbar y bloquea nuevos
+  /// movimientos, pero conserva su historial para reportes/exports.
+  activo Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  creadoPorId String?
+  creadoPor   Usuario? @relation("DepartamentoCreadoPor", fields: [creadoPorId], references: [id], onDelete: SetNull)
+
+  categorias  CategoriaFinanciera[]
+  movimientos MovimientoFinanciero[]
+
+  @@unique([iglesiaId, nombre])
+  @@index([iglesiaId])
+  @@map("departamentos_financieros")
+}
+
+/// Categorías propias por iglesia (ej. Diezmos, Ofrendas, Arriendo, Servicios).
+/// departamentoId = null → categoría de finanzas general; si no, es exclusiva de ese departamento.
+model CategoriaFinanciera {
+  id        String         @id @default(cuid())
+  nombre    String
+  tipo      TipoMovimiento
+  createdAt DateTime       @default(now())
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  /// Cascade: si se elimina un departamento (solo posible cuando ya no tiene movimientos),
+  /// sus categorías huérfanas se van con él en vez de quedar categorías "general" fantasma.
+  departamentoId String?
+  departamento   DepartamentoFinanciero? @relation(fields: [departamentoId], references: [id], onDelete: Cascade)
+
+  movimientos MovimientoFinanciero[]
+
+  // NULL != NULL en un unique de Postgres: este constraint no evita dos categorías
+  // "general" (departamentoId null) con el mismo nombre+tipo. Ver CategoriasService.create.
+  @@unique([iglesiaId, departamentoId, nombre, tipo])
+  @@index([iglesiaId, departamentoId])
+  @@map("categorias_financieras")
+}
+
+model MovimientoFinanciero {
+  id          String         @id @default(cuid())
+  tipo        TipoMovimiento
+  monto       Decimal        @db.Decimal(12, 2)
+  /// Obligatoria: cada movimiento debe quedar trazable en qué se gastó o de dónde vino.
+  descripcion String
+  /// Solo diferencia efectivo de transferencia — no representa cajas ni cuentas separadas.
+  medioPago   MedioPago      @default(EFECTIVO)
+  fecha       DateTime
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  categoriaId String
+  categoria   CategoriaFinanciera @relation(fields: [categoriaId], references: [id])
+
+  /// Inmutable tras la creación (ver UpdateMovimientoDto): null = finanzas general.
+  /// Restrict (no el default de Prisma): un departamento con movimientos NUNCA se
+  /// puede borrar a nivel de DB, ni siquiera si un bug de aplicación lo permitiera.
+  departamentoId String?
+  departamento   DepartamentoFinanciero? @relation(fields: [departamentoId], references: [id], onDelete: Restrict)
+
+  creadoPorId String?
+  creadoPor   Usuario? @relation("MovimientoCreadoPor", fields: [creadoPorId], references: [id], onDelete: SetNull)
+
+  @@index([iglesiaId, fecha])
+  @@index([iglesiaId, departamentoId, fecha])
+  @@map("movimientos_financieros")
+}
+
+/// Historial inmutable de creación/edición/eliminación de movimientos. El snapshot
+/// guarda los datos del movimiento en ese momento porque, si se elimina, la fila
+/// original deja de existir y este es el único registro que queda de ella.
+model MovimientoAuditLog {
+  id        String          @id @default(cuid())
+  accion    AccionAuditoria
+  createdAt DateTime        @default(now())
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  /// Sin relación FK: el movimiento referenciado puede ya no existir (ELIMINACION).
+  movimientoId String
+
+  /// Igual que movimientoId: sin FK, a propósito. Permite filtrar logs por departamento
+  /// (GET /finanzas/movimientos/logs?departamentoId=...) por id estable en vez de por el
+  /// nombre capturado en `snapshot.departamento`, que puede quedar desactualizado si el
+  /// departamento se renombra después de este log.
+  departamentoId String?
+
+  usuarioId String?
+  usuario   Usuario? @relation("AuditoriaRealizadaPor", fields: [usuarioId], references: [id], onDelete: SetNull)
+
+  snapshot Json
+
+  @@index([iglesiaId, createdAt])
+  @@index([iglesiaId, departamentoId, createdAt])
+  @@map("movimientos_auditoria")
+}
+
+// ==========================================================================
+// MÓDULO 3 — NOTAS / TAREAS
+// ==========================================================================
+
+model Nota {
+  id          String      @id @default(cuid())
+  /// RECORDATORIO: tarea corta con fecha límite, asignable. NOTA: texto libre del pastor, sin asignación.
+  tipo        TipoNota    @default(RECORDATORIO)
+  titulo      String
+  descripcion String?
+  fechaLimite DateTime?
+  estado      EstadoTarea @default(PENDIENTE)
+  notificado  Boolean     @default(false)
+  /// Solo se puede archivar en estado COMPLETADA (ver NotasService#archivar). Oculta el
+  /// recordatorio del listado por defecto sin perder su historial, mismo patrón que
+  /// DepartamentoFinanciero.activo.
+  archivado   Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  creadoPorId String
+  creadoPor   Usuario @relation("NotaCreadaPor", fields: [creadoPorId], references: [id])
+
+  asignadoAId String?
+  asignadoA   Usuario? @relation("NotaAsignadaA", fields: [asignadoAId], references: [id], onDelete: SetNull)
+
+  @@index([iglesiaId, fechaLimite])
+  @@map("notas")
+}
+
+// ==========================================================================
+// MÓDULO 4 — INTEGRANTES (censo por QR)
+// ==========================================================================
+
+/// Censo de congregantes vía QR público de la iglesia. Deduplicado por
+/// (iglesiaId, email) o (iglesiaId, run): un re-escaneo con un dato ya
+/// registrado NO sobrescribe la fila existente (ver IntegrantesService#registrar).
+model Integrante {
+  id             String    @id @default(cuid())
+  nombreCompleto String
+  email          String
+  telefono       String
+  fotoUrl        String?
+  /// RUN chileno (NNNNNNNN-D), segunda clave de deduplicación además del email.
+  /// Nullable a nivel de columna: filas creadas antes de este campo no tienen valor;
+  /// toda fila nueva SIEMPRE lo trae porque el DTO lo exige.
+  run            String?
+  /// Elegida por la propia persona en el formulario, no derivada de createdAt
+  /// (puede llevar años en la congregación y recién ahora completar el censo).
+  /// Nullable por la misma razón que run: filas viejas no lo tienen.
+  miembroDesde   DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  asistencias AsistenciaEvento[]
+
+  @@unique([iglesiaId, email])
+  @@unique([iglesiaId, run])
+  @@index([iglesiaId])
+  @@map("integrantes")
+}
+
+// ==========================================================================
+// MÓDULO 5 — CEREMONIAS (registro de matrimonios, bautizos, defunciones y
+// presentaciones — reemplaza el libro físico de la iglesia)
+// ==========================================================================
+
+/// `folio` es el correlativo por iglesia (no global) que identifica la partida del
+/// "libro" — se asigna una sola vez al crear el registro (ver MatrimoniosService#create).
+/// La fecha de emisión que va impresa en el certificado NO se persiste: se calcula como
+/// "hoy" cada vez que se genera el PDF (una reimpresión trae la fecha en que se reimprime).
+model Matrimonio {
+  id           String   @id @default(cuid())
+  folio        Int
+  fecha        DateTime
+  nombreNovio  String
+  nombreNovia  String
+  nombrePastor String
+  ciudad       String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  creadoPorId String?
+  creadoPor   Usuario? @relation("MatrimonioCreadoPor", fields: [creadoPorId], references: [id], onDelete: SetNull)
+
+  @@unique([iglesiaId, folio])
+  @@index([iglesiaId, fecha])
+  @@map("matrimonios")
+}
+
+model Bautizo {
+  id            String   @id @default(cuid())
+  folio         Int
+  fecha         DateTime
+  nombrePersona String
+  nombrePastor  String
+  ciudad        String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  creadoPorId String?
+  creadoPor   Usuario? @relation("BautizoCreadoPor", fields: [creadoPorId], references: [id], onDelete: SetNull)
+
+  @@unique([iglesiaId, folio])
+  @@index([iglesiaId, fecha])
+  @@map("bautizos")
+}
+
+model Defuncion {
+  id            String   @id @default(cuid())
+  folio         Int
+  fecha         DateTime
+  nombreDifunto String
+  nombrePastor  String
+  ciudad        String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  creadoPorId String?
+  creadoPor   Usuario? @relation("DefuncionCreadoPor", fields: [creadoPorId], references: [id], onDelete: SetNull)
+
+  @@unique([iglesiaId, folio])
+  @@index([iglesiaId, fecha])
+  @@map("defunciones")
+}
+
+model Presentacion {
+  id           String   @id @default(cuid())
+  folio        Int
+  fecha        DateTime
+  nombreNino   String
+  nombrePadres String
+  nombrePastor String
+  ciudad       String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  iglesiaId String
+  iglesia   Iglesia @relation(fields: [iglesiaId], references: [id], onDelete: Cascade)
+
+  creadoPorId String?
+  creadoPor   Usuario? @relation("PresentacionCreadoPor", fields: [creadoPorId], references: [id], onDelete: SetNull)
+
+  @@unique([iglesiaId, folio])
+  @@index([iglesiaId, fecha])
+  @@map("presentaciones")
+}

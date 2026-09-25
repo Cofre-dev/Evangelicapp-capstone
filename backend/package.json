@@ -1,0 +1,102 @@
+{
+  "name": "evangelicapp-backend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "sonar": "sonarqube-scanner",
+    "build": "nest build",
+    "start": "nest start",
+    "start:dev": "nest start --watch",
+    "start:prod": "node dist/main",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "lint": "eslint \"{src,test}/**/*.ts\" --fix",
+    "lint:ci": "eslint \"{src,test}/**/*.ts\"",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+    "test": "jest",
+    "prisma:seed": "ts-node prisma/seed.ts",
+    "create:superadmin": "ts-node scripts/create-super-admin.ts",
+    "migrate:uploads": "ts-node scripts/migrate-uploads-to-supabase.ts"
+  },
+  "prisma": {
+    "seed": "ts-node prisma/seed.ts"
+  },
+  "jest": {
+    "moduleFileExtensions": [
+      "js",
+      "json",
+      "ts"
+    ],
+    "rootDir": "src",
+    "testRegex": ".*\\.spec\\.ts$",
+    "transform": {
+      "^.+\\.(t|j)s$": "ts-jest"
+    },
+    "collectCoverageFrom": [
+      "**/*.(t|j)s"
+    ],
+    "coverageDirectory": "../coverage",
+    "testEnvironment": "node"
+  },
+  "dependencies": {
+    "@nestjs/common": "^10.4.0",
+    "@nestjs/config": "^3.3.0",
+    "@nestjs/core": "^10.4.0",
+    "@nestjs/jwt": "^10.2.0",
+    "@nestjs/passport": "^10.0.3",
+    "@nestjs/platform-express": "^10.4.0",
+    "@nestjs/platform-socket.io": "^10.4.22",
+    "@nestjs/schedule": "^6.1.3",
+    "@nestjs/throttler": "^5.2.0",
+    "@nestjs/websockets": "^10.4.22",
+    "@prisma/client": "^5.20.0",
+    "@supabase/supabase-js": "^2.112.2",
+    "bcrypt": "^5.1.1",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.14.1",
+    "cookie-parser": "^1.4.7",
+    "exceljs": "^4.4.0",
+    "jose": "^6.2.8",
+    "ms": "^2.1.3",
+    "nodemailer": "^6.9.15",
+    "passport": "^0.7.0",
+    "passport-jwt": "^4.0.1",
+    "passport-local": "^1.0.0",
+    "pdfkit": "^0.19.1",
+    "reflect-metadata": "^0.2.2",
+    "resend": "^6.18.0",
+    "rxjs": "^7.8.1",
+    "sharp": "^0.35.3",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3.3.5",
+    "@eslint/js": "^10.0.1",
+    "@nestjs/cli": "^10.4.5",
+    "@nestjs/testing": "^10.4.22",
+    "@types/bcrypt": "^5.0.2",
+    "@types/cookie-parser": "^1.4.10",
+    "@types/express": "^4.17.21",
+    "@types/jest": "^30.0.0",
+    "@types/ms": "^2.1.0",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^20.14.0",
+    "@types/nodemailer": "^6.4.16",
+    "@types/passport-jwt": "^4.0.1",
+    "@types/passport-local": "^1.0.38",
+    "@types/pdfkit": "^0.17.6",
+    "eslint": "^10.6.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.6",
+    "globals": "^17.7.0",
+    "jest": "^30.4.2",
+    "prettier": "^3.9.4",
+    "prisma": "^5.20.0",
+    "sonarqube-scanner": "^5.0.0",
+    "source-map-support": "^0.5.21",
+    "ts-jest": "^29.4.11",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4",
+    "typescript-eslint": "^8.63.0"
+  }
+}
